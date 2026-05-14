@@ -63,11 +63,19 @@ async def google_auth_callback(request: Request, db: Session = Depends(get_db)):
     # Check your database: If user exists, log them in; if not, create a new one
     db_user = get_user(db, email)
     if db_user is None:
-        # Build a unique username from the email prefix, appending a counter if needed
+        # Build a unique username from the email prefix.
+        # Query all existing usernames with the same prefix in one shot to avoid
+        # repeated round-trips when many users share the same email prefix.
         base_username = email.split("@")[0]
+        existing = {
+            row.username
+            for row in db.query(User.username)
+            .filter(User.username.like(f"{base_username}%"))
+            .all()
+        }
         username = base_username
         counter = 1
-        while db.query(User).filter(User.username == username).first():
+        while username in existing:
             username = f"{base_username}{counter}"
             counter += 1
 
@@ -81,7 +89,8 @@ async def google_auth_callback(request: Request, db: Session = Depends(get_db)):
             create_user(db, new_user)
             db_user = new_user
         except IntegrityError:
-            # Handle race condition: another request created this user concurrently
+            # Race condition: another request inserted this Google account
+            # concurrently (duplicate email). Roll back and reuse the existing row.
             db.rollback()
             db_user = get_user(db, email)
             if db_user is None:
