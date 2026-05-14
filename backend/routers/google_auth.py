@@ -1,10 +1,10 @@
 from datetime import timedelta
-from click import prompt
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
 from authlib.integrations.starlette_client import OAuth
 import os
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from auth.auth_handler import (
@@ -63,14 +63,31 @@ async def google_auth_callback(request: Request, db: Session = Depends(get_db)):
     # Check your database: If user exists, log them in; if not, create a new one
     db_user = get_user(db, email)
     if db_user is None:
-        # Create a new user if they don't exist
-        db_user = User(
+        # Build a unique username from the email prefix, appending a counter if needed
+        base_username = email.split("@")[0]
+        username = base_username
+        counter = 1
+        while db.query(User).filter(User.username == username).first():
+            username = f"{base_username}{counter}"
+            counter += 1
+
+        new_user = User(
             email=email,
             full_name=name,
-            username=email.split("@")[0],  # Use email prefix as username
+            username=username,
             hashed_password=None,  # Password is not needed for OAuth
         )
-        create_user(db, db_user)
+        try:
+            create_user(db, new_user)
+            db_user = new_user
+        except IntegrityError:
+            # Handle race condition: another request created this user concurrently
+            db.rollback()
+            db_user = get_user(db, email)
+            if db_user is None:
+                raise HTTPException(
+                    status_code=500, detail="Failed to create or retrieve user account"
+                )
 
     # Generate a session or JWT for the frontend
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
